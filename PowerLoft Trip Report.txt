@@ -1,0 +1,41 @@
+Power Loft Contact Info
+NOC Phone Number 1 703-659-2426
+Jose Gomez Until 23:00
+Gerald Woods 23:00 to 11:00
+Jose Gomez 11:00 to 23:00
+jeff.ivey@copt.com
+jenny.schafer@copt.com
+
+Logged in remotely at 8am
+Checked all logs and eventviewers for obvious problems
+Called Gerald Woods to check why RS12 SCR not working (Display problem with SCR)
+Restarted Log Inserter.
+The problem looks to be with the query server( possibly a memory leak ).
+I am currently attempting to detatch the database.
+This will take some time based on the size of the database.
+Currently all data is intact and we also have a complete backup of the database from the scheduled backup
+of Sunday night.
+I re-attached a new database, deleted the tree files to clean out any cached data,
+All data is now coming in for the past two days and back to the 15th.
+Called Jose Gomez at the NOC to verify he was seeing data
+Started MS1 Gen to verify data is coming into global event viewer, not happening.
+Still working
+Did restart of server
+Alarms from Earlier run of Gen came in.
+Repeated Starting MS1 Gen to verify data is coming into global event viewer, still not happening.
+Restored all VIP files with backup from 12-11-2011
+Deleted the tree files to clean out any cached data
+deleted several vip.bak.error files from Vip file directories
+restarted Server 
+created several test setpoints on RPU12 SCR screen  setpoints from VIP and Meter
+Found that the EL cutoff for the VIP I was using for testing was set to 192.
+Did Fast Link on just the VIP I was testing
+Received alarms while designer was open closed designer and no further alarms came through.
+stopped loginserter
+Restored the loginserter files from backup
+Deleted loginserter tree files.
+Restarted log inserter 
+Rebooted the NOC workstation.
+files restored
+
+Closed designer and found this was just a fluke

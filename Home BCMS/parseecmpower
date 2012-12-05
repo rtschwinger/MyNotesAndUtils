@@ -1,0 +1,1509 @@
+#!/usr/bin/perl -w
+#2345678911234567892123456789312345678941234567895123456789612345678971234567898
+
+# License: GPL v3
+# by Marc MERLIN <marc_soft at merlins.org>, 2010/07/07 
+# $Id: parseecmpower 327 2011-03-22 05:01:11Z svnuser $
+
+use strict;
+use Date::Manip;
+use Getopt::Long;
+use DB_File;
+
+my $VERBOSE = 0;
+
+# http://graphcomp.com/info/specs/ansi_col.html
+my $OUTPUTTYPE = "none";
+$_ = `tty`;
+$OUTPUTTYPE = "tty" if m#/dev#;
+
+# how many lines is a single set of records (you can overshoot by a bit)
+my $REC_LINES = 14;
+
+# How many watts we want to see to decide that the PV system is active
+my $PVMinWatts = 100;
+
+# Max Watts that can be read on any probe, more than that is an error.
+my $MaxWatts = 50000;
+
+#my $AllowedKwhDiffPerSec = $MaxWatts/3600*1000;
+# make it a round number for display
+my $AllowedKwhDiffPerSec = 0.003;
+
+# How many Kwh we want to see in an hour before we'll consider the value
+# (remove noise)
+my $MinHourKwh = 0.03;
+
+my $TEN_MIN_SAMPLE = 0;
+
+my $ECM;
+
+# How many lines we read at once. Big blocks are good since we can only process
+# a DST time change or parsing problem within a block, but big blocks take a lot
+# of RAM. 100,000 is safe, >1M stretches a 32bit machine with a 2GB process limit.
+my $PARSE_LINE_BLOCK = 1000000;
+
+my $LOGFILE;
+usage() if ($#ARGV == -1);
+
+my @probes;
+if ($ARGV[0] eq "--ecm1")
+{
+    @probes = ( 
+	"Volts", 
+	"PG&E", 
+	"PV", 
+	"Computer Closet", 
+	"MythTV/AV System", 
+	"Computer Office/BR4", 
+	"AC", 
+	"Kitchen Fridge", 
+	"spare0", 
+	"spare1", 
+	"spare2", 
+	"spare3", 
+	"spare4", 
+	"spare5" 
+    );
+    $ECM = "--ecm1";
+    $LOGFILE = "/var/log/ecm/ecmread1";
+}
+elsif ($ARGV[0] eq "--ecm2")
+{
+    @probes = ( 
+	"Volts", 
+	"GaragePlugs1", 
+	"GaragePlugs2/Fridge", 
+	"Washer/Dishwasher", 
+	"All Lights", 
+	"Furnace and Fans", 
+	"Kitchen Plugs/Microwave", 
+	"LVR Plugs/KitchFan", 
+	"Microwave",	# left over for compatibility
+	"Dishwasher",	# left over for compatibility
+	"spare2", 
+	"spare3", 
+	"spare4", 
+	"spare5",
+	"spare6",
+	"spare7", 
+    );
+    $ECM = "--ecm2";
+    $LOGFILE = "/var/log/ecm/ecmread2";
+}
+else
+{
+    usage();
+}
+shift(@ARGV);
+
+# It really sucks that I have to store a single value and split it with |, but a tied hash only seems to
+# accept actual elements, not references to other objects, so I don't seem to have a choice :-/
+sub probe_hash_value
+{
+    ($_) = @_;
+
+    s/\|.*//;
+    return ($_);
+}
+
+sub probe_hash_time
+{
+    ($_) = @_;
+
+    s/.*\|//;
+    return ($_);
+}
+
+
+sub reset_idx_hash
+{
+    my $hash;
+
+    foreach my $probe (@probes)
+    {
+	$hash->{$probe} = "U";
+    }
+    return $hash;
+}
+
+sub fix_rrdtool_headers
+{
+    $_ = $_[0];
+    s/PG&E/PGE/;
+    s/ /_/g;
+    s/\//-/g;
+    s/KitchFan/KitchFn/;
+    s/Microwave/uwave/;
+
+    return $_;
+}
+
+my $template_str = fix_rrdtool_headers(join(":", @probes));
+
+my @timeslot;   # array of increasing timeslots that can be fed as keys to %data
+my %counter_offsets;
+	
+my $PRINT_TIME = 0;
+my $RRDTOOL = 0;
+my $CACTI = 0;
+my $CACTI_DUMP = 0;
+my $CACTI_DUMP_HEADER;
+my $GOOGLE_POWERMETER_DUMP = 0;
+my $GOOGLE_POWERMETER_TAIL = 0;
+my $PARSE_MONTH = 0;
+my $OFFSET_NORESET = 0;
+
+# Yet another gross hack, callers can reset this regex to something more
+# stringent to only get full minutes' worth of data or every 10 seconds.
+my $NOFILTER = ".";
+my $TENSECFILTER = '^\d\d\d\d/\d\d/\d\d \d\d:\d\d:\d0: ';
+my $MINUTEFILTER = '^\d\d\d\d/\d\d/\d\d \d\d:\d\d:00: ';
+my $TENMINUTEFILTER = '^\d\d\d\d/\d\d/\d\d \d\d:\d0:00: ';
+
+# Set the counter reset to the live logfile value, even if reading from STDIN lower down.
+# This keeps track of counter overflows.
+my $dbfilename;
+
+use constant PEAK =>	    1;
+use constant PARPK =>	    2;
+use constant OFFPK =>	    3;
+my %levels = (
+   -2 => "Winter Partial Peak",
+   -3 => "Winter Off Peak",
+    1 => "Summer Peak",
+    2 => "Summer Partial Peak",
+    3 => "Summer Off Peak"
+);
+
+# compute PG&E date to peak / partial peak / off peak
+# http://www.pge.com/tariffs/doc/E-6.doc
+# http://www.pge.com/tariffs/electric.shtml
+# E6 times at the bottom of:
+# http://www.pge.com/includes/docs/pdfs/b2b/newgenerator/solarwindgenerators/standardenet/howto_readnemmeter_e6.pdf
+# Find the baseline quantity here:
+# http://www.pge.com/myhome/customerservice/financialassistance/medicalbaseline/understand/
+# but knowing what your baseline quantity is for each month is not fun,
+# they can change it at any time. It's about 13Kwh/day in zone X
+use constant BASELINEPERDAY => 13;
+# for tier debugging
+#use constant BASELINEPERDAY => 4;
+
+# M-F 10:00-13:00 PP
+# M-F 13:00-19:00 P
+# M-F 19:00-21:00 PP
+# M-F 21:00-10:00 OP
+# SS  17:00-20:00 PP
+# SS  20:00-17:00 OP
+#				    PEAK     PART-PK  OFF-PEAK
+my @Summer = (
+["Baseline Usage",		    0.29320, 0.14456, 0.08458],
+["101% - 130% of Baseline",	    0.30900, 0.16036, 0.10038],
+["131% - 200% of Baseline",	    0.43690, 0.28857, 0.22872],
+["201% - 300% of Baseline",	    0.55568, 0.40735, 0.34750],
+["Over 300% of Baseline",	    0.61792, 0.46960, 0.40974] );
+
+# Winter
+# M-F 17:00-20:00 PP
+# rest: OP
+my @Winter = (
+["Baseline Usage",		    0,       0.10033, 0.08848],
+["101% - 130% of Baseline",	    0,       0.11612, 0.10424],
+["131% - 200% of Baseline",	    0,       0.24443, 0.24443],
+["201% - 300% of Baseline",	    0,       0.36321, 0.35151],
+["Over 300% of Baseline",	    0,       0.42546, 0.41375] );
+
+# what percentage of baseline is allowed in each subsequent tier
+my @tier_breakpoints = ( 0, 100, 30, 70, 100, 99999999 );
+
+sub verbose
+{
+    my ($mesg, $level) = @_;
+    $level = 1 if (not $level);
+
+    warn("$mesg\n") if ($VERBOSE >= $level);
+}
+
+sub color
+{
+    # http://graphcomp.com/info/specs/ansi_col.html
+    # http://www.utexas.edu/learn/html/colors.html
+    my ($color) = @_;
+
+    return if ($OUTPUTTYPE eq "none");
+    return if (not $color);
+
+    print $OUTPUTTYPE eq "tty" ? "[40m[0m" : "" if ($color eq "init");
+    print $OUTPUTTYPE eq "tty" ? "[40m[0m" : "" if ($color eq "end");
+    print $OUTPUTTYPE eq "tty" ? "[0m" : "</FONT>" if ($color eq "endcolor");
+
+    print $OUTPUTTYPE eq "tty" ? "[1;31m" : "<FONT COLOR=#FF0000>" if ($color eq "red");
+    print $OUTPUTTYPE eq "tty" ? "[1;33m" : "<FONT COLOR=#FF6600>" if ($color eq "yellow");
+    print $OUTPUTTYPE eq "tty" ? "[1;34m" : "<FONT COLOR=#0000FF>" if ($color eq "blue");
+    print $OUTPUTTYPE eq "tty" ? "[0m" : "<FONT COLOR=#000000>" if ($color eq "white");
+
+}
+
+# returns what peak tier the date is in (1, 2, 3) and negative for winter tiers
+sub date_to_peak_level
+{
+    my ($date, $tier) = @_;
+    my $wday = UnixDate($_[0], "%w");
+    my $hour = UnixDate($_[0], "%H");
+    my $month = UnixDate($_[0], "%m");
+
+    # winter is Nov 1st to Apr 30th
+    if ($month <= 4 or $month >= 11)
+    {
+	if (Date_IsWorkDay($date))
+	{
+	    if ($hour <= 17 or $hour >= 20) { return OFFPK * -1 } else { return PARPK * -1 }
+	}
+	return OFFPK * -1;
+    }
+    # summer
+    else
+    {
+	verbose("Checking for summer holiday on $date ($wday)", 3);
+	return OFFPK if (Date_IsHoliday($date));
+	# sat and sun
+	if ($wday >= 6)
+	{
+	    verbose("Checking for summer partial peak or offpeak on weekend ($wday)", 3);
+	    return ($hour >= 17 and $hour <= 20) ? PARPK : OFFPK;
+	}
+	# we're left with weekdays
+	verbose("Checking for summer peak on hour $hour / $wday", 3);
+	return PEAK if ($hour >= 13 and $hour <= 19);
+	verbose("Checking for summer partial peak on hour $hour / $wday", 3);
+	return PARPK if (($hour >= 10 and $hour <= 13) or ($hour >= 19 and $hour <= 21));
+	verbose("left with summer off peak on hour $hour / $wday", 3);
+	return OFFPK;
+    }
+}
+
+sub peak_level_to_price
+{
+    my ($peaklevel, $tier) = @_;
+    $tier = 0 if (not defined $tier);
+
+    die "Can't be called with peaklevel 0" if (not $peaklevel);
+
+    if ($peaklevel < 0)
+    {
+	$peaklevel *= -1;
+	return $Winter[$tier][$peaklevel];
+    }
+    else { return $Summer[$tier][$peaklevel]; }
+}
+
+sub date_to_hour
+{
+    return UnixDate($_[0], "%H");
+}
+
+sub date_to_wday
+{
+    return UnixDate($_[0], "%a");
+}
+
+sub date_to_epoch
+{
+    return UnixDate($_[0], "%s");
+}
+
+
+sub delta_hms
+{
+    $_ = DateCalc($_[0], $_[1]);
+    #warn "Got delta $_ from ".join("|", @_)."\n";
+
+    return sprintf("%5.2f", Delta_Format($_, 1, "%hd"));
+}
+
+# returns positive if arg2 > arg1
+sub delta_sec
+{
+    $_ = DateCalc($_[0], $_[1]);
+    #warn "Got delta $_ from ".join("|", @_)."\n";
+
+    return Delta_Format($_, 1, "%sh");
+}
+
+sub printable_date
+{
+    return UnixDate($_[0], "%Y/%m/%d %T");
+}
+
+sub printable_time
+{
+    return UnixDate($_[0], "%T");
+}
+
+sub powermeter_date
+{
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = gmtime(UnixDate($_[0], "%s"));
+
+    $year += 1900;
+    $mon += 1;
+
+    return sprintf("%d-%02d-%02dT%02d:%02d:%02dZ", $year, $mon, $mday, $hour, $min, $sec);
+}
+
+
+
+# load all the data samples in %data and the timeslots keys in @timeslot
+# %date time are local time at read time and are stored in Date::Manip
+# format (YYYMMDDHH:MM:SS)
+sub load_file_data
+{
+    my $main_line_number = 0; # Keep track of which line number was read in the input.
+    my %data_line;	# which line each data sample was gathered from
+
+    # fromdate and todate are given in localtime as per locale
+    my ($FH, $h_data, $fromdate, $todate, $print_first_parsed_date) = @_;
+    # convert them once to parsed format so that comparisons can be done as strings
+    my ($parsed_fromdate, $parsed_todate) = (ParseDate($fromdate), ParseDate($todate));
+
+    my $needsync = 1;
+    my $datatime = 0;
+    my $dataline;
+    # previous data record is used to compute average watts per timeslice
+    my $prev_dataline;
+    my $prev_datatime;
+
+    # Re-initialize for multiple runs.
+    undef @timeslot;
+
+    $print_first_parsed_date = 1 if (not defined $print_first_parsed_date);
+    verbose("load_file_data: between $parsed_fromdate and $parsed_todate from $FH");
+    for (my $line=1; $_ = ${$FH}[$line-1] and $line <= $#{$FH} + 1; $line++)
+    {
+	my ($probe, $value);
+
+	$main_line_number++;
+	chomp;
+	my $read_line = $_;
+
+	# Volt is our first line, the sync line
+	if ($read_line =~ /Volts:/)
+	{
+	    #warn("Synced on $_");
+	    $needsync = 0;
+	    $dataline = reset_idx_hash();
+	}
+	# If we needed to resync, and didn't get Volt, look for it
+	elsif ($needsync)
+	{
+	    next;
+	}
+	# otherwise reject unknown lines, including
+	# 2010/07/10 21:06:25: Ch1 Positive Watts:    805.910KWh ( 1385W)
+	elsif (not $read_line =~ /(Volts|[1-5] Watts)/)
+	{
+	    # skip known lines
+	    next if ($read_line =~ /^\s*$/ or $read_line =~ /Ch. (Positive|Negative) Watts/);
+	    warn("Skipping line $read_line\n");
+	    next;
+	}
+
+	#warn "working on line $_\n";
+
+	# 2010/07/10 21:06:25: Phase1 Volts:                 119.60V
+	if ($read_line =~ /^(\d\d\d\d\/\d\d\/\d\d \d\d:\d\d:\d\d): .*Volts:\s+([0-9.]+)V/)
+	{
+	    $datatime = $1;
+	    #warn("Storing $2 in slot ".VOLTS."\n");
+	    if ($2 < 0 or $2 > 250)
+	    {
+		warn("WARN: Got invalid volts $2 at $datatime, resyncing...\n");
+		$needsync = 1;
+		next;
+	    }
+	    
+	    $dataline->{'Volts'} = $2;
+	}
+	# 2010/07/10 21:06:25: Ch1 Watts:            -313.267KWh ( 1385W) < PG&E
+	elsif  ($read_line =~ /^(\d\d\d\d\/\d\d\/\d\d \d\d:\d\d:\d\d): Ch([12]) Watts:\s+([-0-9.]+)KWh\s+\(\s*([-0-9.]+)W\) < (.*?)\s*$/)
+	{
+	    $datatime = $1;
+	    # Reject values that are too big, or '0' after any hash offset has been computed
+	    # (dirty hack to accept '0' values from the initial data before counters start to turn).
+	    if (abs($4) > $MaxWatts)
+	    {
+		warn("WARN: Got invalid watts $4 in Ch $2 at $datatime, resyncing...\n");
+		$needsync = 1;
+		next;
+	    }
+	    if ($3 == 0 and probe_hash_value($counter_offsets{$5}))
+	    {
+		warn("WARN: Got null KWh counter $3 in Aux $2 at $datatime, resyncing...\n");
+		$needsync = 1;
+		next;
+	    }
+	    if (not defined $dataline->{$5})
+	    {
+		warn("WARN: Got input line for probe $5 at $1 which is not known in internal hash, full line: $_\n");
+		next;
+	    }
+	    #warn("Storing $3 in slot $2/$4\n");
+	    $dataline->{$5} = $3;
+	}
+	# 2010/07/10 21:06:25: Aux1 Watts:            376.275KWh (  364W) < Computer Closet
+	elsif  ($read_line =~ /^(\d\d\d\d\/\d\d\/\d\d \d\d:\d\d:\d\d): Aux([1-5]) Watts:\s+([-0-9.]+)KWh\s+\(\s*([-0-9.]+)W\) < (.*)/)
+	{
+	    $datatime = $1;
+	    if ($4 > $MaxWatts)
+	    {
+		warn("WARN: Got invalid watts $4 in Aux $2 at $datatime, resyncing...\n");
+		$needsync = 1;
+		next;
+	    }
+	    if ($4 < 0)
+	    {
+		warn("WARN: Got invalid negative watts $4 in Aux $2 at $datatime, resyncing...\n");
+		$needsync = 1;
+		next;
+	    }
+	    if ($3 == 0 and probe_hash_value($counter_offsets{$5}))
+	    {
+		warn("WARN: Got null KWh counter $3 in Aux $2 at $datatime, resyncing...\n");
+		$needsync = 1;
+		next;
+	    }
+	    if (not defined $dataline->{$5})
+	    {
+		warn("WARN: Got input line for probe $5 at $1 which is not known in internal hash, full line: $_\n");
+		next;
+	    }
+	    #warn("Storing $3 in aux slot ".($2 + 2)."\n");
+	    $dataline->{$5} = $3;
+	}
+	else
+	{
+	    warn ("Can't parse line $main_line_number: $_");
+	    next;
+	}
+	$datatime = ParseDate($datatime);
+	#warn ("Accepted date $datatime\n");
+
+	if ($print_first_parsed_date)
+	{
+	    verbose("First log entry starts from ".printable_date($datatime));
+	    $print_first_parsed_date = 0;
+	}
+
+	if ($datatime lt $parsed_fromdate)
+	{
+	    # speed up parsing
+	    verbose("datatime $datatime is too early, skipping record", 5);
+	    $needsync = 1;
+	    next;
+	}
+	elsif ($parsed_todate lt $datatime)
+	{
+	    # got the last sample we want, stop parsing
+	    verbose("datatime $datatime is now past $parsed_todate, stopping read");
+	    last;
+	}
+	else
+	{
+	    if ($read_line =~ /Aux5/)
+	    {
+		# If this was the last probe, do some local hacks to fix data
+
+                # Fix PV probe to show positive since it's easier to
+		# deal with positive data for cacti and google powermeter
+		$dataline->{'PV'} *= -1 if ($dataline->{'PV'} and $dataline->{'PV'} ne "U");
+
+		# First time around the loop, we make sure the prev_* values are defined.
+		if (not defined $prev_datatime)
+		{
+		    $prev_datatime = $datatime;
+		    $prev_dataline = $dataline;
+		}
+
+		# Date::Manip is being too helpful, it'll use DST to find 1H extra at DST jumps
+		# Forcing UTC during diffs takes care of that:
+		#   DB<9> print DateCalc("2010/11/07 01:00:00", "2010/11/07 00:59:50")
+		# +0:0:-0:0:1:0:10                
+		#   DB<10> print DateCalc("2010/11/07 01:00:00 UTC", "2010/11/07 00:59:50 UTC")
+		# +0:0:-0:0:0:0:10
+		my $sample_delta = delta_sec($prev_datatime." UTC", $datatime." UTC");
+                # we have 1 sec resolution and can decide to only parse and
+                # filter out minutely data, so let's not complain for any jump
+                # less than 121 sec (allows for one missed data sample)
+		if ($prev_datatime and (($sample_delta > 121 and not $TEN_MIN_SAMPLE) or $sample_delta > 1200))
+		{
+		    warn "WARN: data log time jumped by $sample_delta sec at $datatime (from $prev_datatime at line $main_line_number)\n";
+		}
+
+		# Fix all read values by the offset that's saved for the last time we fixed things up.
+		# This works for a linear parse from sample 1, and re-reading the last few samples
+		# (it is to make cacti happy and provide ever increasing values from the very first sample).
+		# This does NOT do the right thing when we reparse old data without resetting the counters
+		# (like rescanning a day's worth to provide a day summary).
+		foreach my $key (keys %{$dataline})
+		{
+		    $dataline->{$key} += probe_hash_value($counter_offsets{$key}) if ($dataline->{$key} ne "U");
+		}
+		if ($prev_datatime and $sample_delta < 0)
+		{
+		    warn "WARN: data log time jumped back by $sample_delta sec at $datatime (from $prev_datatime at line $main_line_number)\n";
+		}
+		elsif  ($prev_datatime ne $datatime)
+		{
+		    # Let's now see if something weird happened to the Kwh values (counter reset).
+		    foreach my $key (keys %{$dataline})
+		    {
+			next if ($prev_dataline->{$key} eq "U" or $dataline->{$key} eq "U");
+			next if ($key eq 'Volts');
+			my $offset = ($prev_dataline->{$key} - $dataline->{$key});
+			my $offset_allowed = abs($AllowedKwhDiffPerSec * $sample_delta);
+
+			#warn("Got offset $offset (out of $offset_allowed) for $key\n");
+
+                        # Once an offset is set, getting the last sample for rrdtool does involve reading the last 5 samples' worth
+			# and we don't want to recompute a new offset each time a 'jump' is re-read. This makes sure it only 
+			# happens once per data sample.
+			if (abs($offset) > $offset_allowed) 
+			{
+			    my $offset_time = probe_hash_time($counter_offsets{$key});
+			    # Update the offset counter, but only if datatime is newer than the last offset computation value.
+			    if (delta_sec($offset_time, $datatime) > 0)
+			    {
+				my $offset_value = probe_hash_value($counter_offsets{$key});
+				$offset_value += $offset;
+				$counter_offsets{$key} = "$offset_value|$datatime";
+
+				warn("WARN: Data sample error at $datatime: $key went from ".$prev_dataline->{$key}."Kwh to ".$dataline->{$key}."Kwh, in $sample_delta sec which is bigger than the allowed ${offset_allowed}Kwh. New offset for $key was increased by $offset to $offset_value\n");
+				$dataline->{$key} += $offset;
+			    }
+			    else
+			    {
+				# This is a problem when we recompute data for the day later on.
+				warn("WARN: Data jump at $datatime: $key went from ".$prev_dataline->{$key}."Kwh to ".$dataline->{$key}."Kwh, in $sample_delta sec which is bigger than the allowed ${offset_allowed}Kwh. However $datatime is older than the last offset fix time: $offset_time, so not adjusting offset\n");
+
+			    }
+			}
+			else
+			{
+			    #warn("Time diff at $datatime is $sample_delta with offset $offset\n");
+			}
+		    }
+		}
+
+		# This dupe detection code will fail if it happens across a block read boundary
+		# ($lineblock in cacti_dump). Just hope it doesn't happen in the wrong place.
+		if (defined $h_data->{$datatime})
+		{
+		    my $probe_name = $probes[1];
+		    my $old_value = $h_data->{$datatime}->{$probe_name};
+		    my $old_value_line = $data_line{$datatime};
+		    my $new_value = $dataline->{$probe_name};
+		    warn("Ignoring redefined data sample at $datatime ($probe_name was $old_value at line $old_value_line, which won't be replaced with $new_value at line $main_line_number).\n");
+		    next;
+		}
+
+		$h_data->{$datatime} = $dataline;
+		$data_line{$datatime} = $main_line_number;
+		#warn("going to push ".join("/", %{$dataline})." with index $datatime\n");
+
+		push (@timeslot, $datatime);
+		$prev_dataline = $dataline;
+		$prev_datatime = $datatime;
+	    }
+	}
+    }
+    verbose("load_file_data: gathered $#timeslot timeslots", 2);
+}
+
+sub compute_watts
+{
+    my ($h_data, $probe, $timeslot) = @_;
+    my $Watts;
+
+    return 0 if ($timeslot eq 0);
+
+    my ($slot1, $slot2) = ($timeslot[$timeslot-1], $timeslot[$timeslot]);
+    # Date::Manip is being too helpful, it'll use DST to find 1H extra at DST jumps
+    # Forcing UTC during diffs takes care of that:
+    my $sample_delta = delta_sec($slot1." UTC", $slot2." UTC");
+
+    $Watts = 3600 * 1000 * ( $h_data->{$slot2}->{$probe} - $h_data->{$slot1}->{$probe} ) / $sample_delta;
+}
+
+
+sub parse_and_print_day
+{
+    my @hourrate;   # array of first timeslot for each new hour (used for getting
+		    # the billing rate for each hour block later on)
+    # all work is done on local timezone dates
+    my ($h_data, $fromdate, $todate, $print) = @_;
+    my ($pfromdate, $ptodate) = (printable_date($fromdate), printable_date($todate));
+    my ($unix_fromdate, $unix_todate) = (date_to_epoch($fromdate), date_to_epoch($todate));
+    my $parsehour = 0;
+    my $hour_first_slot;
+    my @hour_kwh_sum;
+    my @hour_dollar_sum;
+    my (%rate_kwh_sum, %rate_dollar_sum);
+    my ($pv_start, $pv_stop, $pv_hours) = (0, 0, 0);
+    my $cur_hour;
+    my ($parsed_fromdate, $parsed_todate) = (ParseDate($fromdate), ParseDate($todate));
+    # the loop needs to go into the next hour before it can close the 23rd hour
+    my $parsed_aftertodate = DateCalc($todate, "+10 minutes");
+
+    $print = 1 if (not defined $print);
+
+    die "No data read for $pfromdate -> $ptodate\n" if ($#timeslot == -1);
+    # -10mn is because the first timeslot is slightly bigger than our start date
+    $_ = DateCalc($timeslot[0], "-10 minutes");
+    warn "Earliest data record (".printable_date($timeslot[0]).") is newer than $pfromdate, data will be clipped. Try a bigger tail value ($_ > $parsed_fromdate)\n" if ($_ gt $parsed_fromdate);
+    verbose("Got $#timeslot data samples for $pfromdate ($parsed_fromdate) to $ptodate ($parsed_todate). They go from ".$timeslot[0]." to ".$timeslot[$#timeslot], 2);
+    foreach my $timeslot (0 .. $#timeslot)
+    {
+	my $pv_watts;
+	next if ($timeslot[$timeslot] lt $parsed_fromdate);
+	last if ($timeslot[$timeslot] gt $parsed_aftertodate);
+	$hour_first_slot = $timeslot if (not $hour_first_slot);
+	verbose("Will parse timeslot $timeslot, date $timeslot[$timeslot] between $parsed_fromdate and $parsed_todate", 4);
+
+	$h_data->{$timeslot[$timeslot]}->{'House'} = $h_data->{$timeslot[$timeslot]}->{'PG&E'} + $h_data->{$timeslot[$timeslot]}->{'PV'};
+	$h_data->{$timeslot[$timeslot]}->{'HouseNoAC'} = $h_data->{$timeslot[$timeslot]}->{'House'} - $h_data->{$timeslot[$timeslot]}->{'AC'};
+
+	$cur_hour = date_to_hour($timeslot[$timeslot]);
+
+	# find the first time slot where we have non leakage current
+	# detected on the PV system (more than $PVMinWatts watts)
+	$pv_watts = compute_watts($h_data, 'PV', $timeslot);
+	if ($pv_watts > $PVMinWatts )
+	{
+	    $pv_start = $timeslot if (not $pv_start);
+	    $pv_stop = $timeslot;
+	    verbose("PV watts is $pv_watts for $cur_hour/$timeslot and now have start: $pv_start and stop: $pv_stop", 4);
+	}
+	else
+	{
+	    verbose("PV is not registering data. PV watts is ".$h_data->{$timeslot[$timeslot]}->{'PV'}." for $cur_hour/$timeslot and now have start: $pv_start and stop: $pv_stop", 5);
+	}
+	verbose("House watts: ".compute_watts($h_data, 'House', $timeslot)."W (inst)", 4);
+
+	verbose("Now cur $cur_hour parse $parsehour | $timeslot out of $#timeslot", 4);
+	# loop ends when curhour loops back to 0 (and parsehour is 23) or timeslot is the last one
+	if ($cur_hour > $parsehour or $cur_hour < $parsehour or $timeslot == $#timeslot)
+	{
+	    my $level = date_to_peak_level($timeslot[$timeslot-1]);
+	    my $rate = peak_level_to_price($level);
+	    $hourrate[$parsehour] = $level;
+	    verbose("$parsehour is rate $rate (level $level)");
+	    if ($timeslot == 0)
+	    {
+		warn ("Data only starts a $cur_hour:00 (earlier hours missing)\n");
+		$parsehour = $cur_hour;
+		next;
+	    }
+	    #print "Entered cur $cur_hour parse $parsehour | $timeslot out of $#timeslot\n";
+	    foreach my $probe ("House", "HouseNoAC", "AC", "PV", "PG&E")
+	    {
+		my $cost;
+		my $kwh = $h_data->{$timeslot[$timeslot-1]}->{$probe} - $h_data->{$timeslot[$hour_first_slot]}->{$probe};
+		$kwh *= -1 if ($probe eq "PV");
+		# remove noise
+		$kwh = 0 if (abs($kwh) <= $MinHourKwh);
+		$cost = $kwh * $rate;
+		$hour_kwh_sum[$parsehour]->{$probe} = $kwh;
+		$hour_dollar_sum[$parsehour]->{$probe} += $cost;
+		verbose("for hour $parsehour, $kwh Kwh for probe $probe at rate $rate costs $cost (between timeslot ".$timeslot[$hour_first_slot]." and ".$timeslot[$timeslot-1]." ($hour_first_slot to ".($timeslot-1).")", 3);
+
+		$rate_kwh_sum{$level}->{$probe} += $kwh;
+		$rate_dollar_sum{$level}->{$probe} += $cost;
+		verbose("after hour $parsehour, day has seen ".$rate_kwh_sum{$level}->{$probe}."kWh at level $level for a total dollar value ".$rate_dollar_sum{$level}->{$probe}." on $probe", 2);
+	    }
+
+	    last if ($parsehour > $cur_hour);
+	    $parsehour = $cur_hour;
+	    $hour_first_slot = $timeslot
+	}
+    }
+    foreach my $probe ("House", "HouseNoAC", "AC", "PV", "PG&E")
+    {
+	$hour_kwh_sum[99]->{$probe} = $h_data->{$timeslot[$#timeslot]}->{$probe} - $h_data->{$timeslot[0]}->{$probe};
+	$hour_dollar_sum[99]->{$probe} = 0;
+	foreach my $hour (0 .. $parsehour)
+	{
+	    verbose("Adding sum for $probe on hour $hour", 4);
+	    $hour_dollar_sum[99]->{$probe} += $hour_dollar_sum[$hour]->{$probe} if ($hour_dollar_sum[$hour]->{$probe});
+	}
+    }
+
+    if ($pv_start > 0)
+    {
+	$pv_hours = delta_hms($timeslot[$pv_start], $timeslot[$pv_stop]);
+	$pv_start = printable_time($timeslot[$pv_start]);
+	$pv_stop = printable_time($timeslot[$pv_stop]);
+    }
+
+
+    if ($print)
+    {
+	if ($OUTPUTTYPE eq "html")
+	{
+	    ($_ = $ptodate) =~ s/.* //;
+	    my $title = "Power details from ".date_to_wday($fromdate).": $pfromdate to $_";
+	    print "<HTML><HEAD><TITLE>$title</TITLE></HEAD>\n";
+	    print "<BODY>\n";
+	    print "<H1>$title</H1>\n";
+	    print "<PRE>\n";
+	}
+	print "\nHourly Differences\n";
+	foreach my $hour (0 .. $cur_hour, 99)
+	{
+	    if (not $hour_kwh_sum[$hour])
+	    {
+		warn("No data gathered for $hour:00\n");
+		next;
+	    }
+	    if ($hour < 99)
+	    {
+		printf("%02d", $hour);
+		if ($hourrate[$hour] < 0)
+		{
+		    # blue is a fake color that should not happen, left for debugging
+		    color( ["", "blue", "yellow", "white"]->[-$hourrate[$hour]] );
+		    #          N/A  PP   OFFP (Winter)
+		    print ["", "H", "^", "v"]->[-$hourrate[$hour]];
+		}
+		else
+		{
+		    color( ["", "red", "yellow", "white"]->[$hourrate[$hour]] );
+		    #          PEAK PP   OFFP (Summer)
+		    print ["", "~", "-", "_"]->[$hourrate[$hour]];
+		}
+		print ":";
+	    }
+	    else
+	    {
+		print "-"x100,"\n";
+		print date_to_wday($todate).":";
+	    }
+	    # nicely ordered fields
+	    foreach my $probe ("House", "AC", "HouseNoAC", "PV", "PG&E")
+	    {
+		printf("% 5.1fKwh/", $hour_kwh_sum[$hour]->{$probe});
+
+		$_ = sprintf("\$% 3.1f ", $hour_dollar_sum[$hour]->{$probe});
+		if ($hour eq 99)
+		{
+		    # this would show the sign
+		    s/\$(.)/$1\$/;
+		    # remove trailing space for column alignment
+		    s/ $//;
+		}
+		else
+		{
+		    # but for normal colums, we remove it
+		    s/\$(.)/\$/;
+		}
+		print $_;
+		print "$probe|";
+	    }
+	    color("endcolor");
+	    if ($hour == 99)
+	    {
+		my $i = 1;
+		print "\n\nSplit per rate:";
+		foreach my $level (reverse sort {abs($a) <=> abs($b)} keys %rate_kwh_sum)
+		{
+		    my $rate = peak_level_to_price($level);
+		    $_ = sprintf("%3.2f", $rate);
+		    s/^0/\$/;
+		    printf "\n";
+		    color( ["", "white", "yellow", "red"]->[$i++] );
+		    print "$_";
+		    foreach my $probe ("House", "AC", "HouseNoAC", "PV", "PG&E")
+		    {
+			printf("% 5.1fKwh/", $rate_kwh_sum{$level}->{$probe});
+			$_ = sprintf("\$% 4.2f", $rate_dollar_sum{$level}->{$probe});
+			# this would show the sign
+			#s/\$(.)/$1\$/;
+			# but we'll remove it since it's redundant
+			s/\$(.)/\$/;
+			print $_;
+			print "$probe|";
+		    }
+		    color("endcolor");
+		}
+	    }
+	    print "\n";
+	}
+
+	my $pv_total = sprintf("% 5.1fKwh", $hour_kwh_sum[99]->{PV});
+	print "\nSolar panels produced $pv_total during ${pv_hours}h, between $pv_start and $pv_stop\n" if ($pv_start);
+
+	if ($OUTPUTTYPE eq "html")
+	{
+	# Yeah, all hardcoded, change/remove as required for you
+	print  <<EOF;
+	    </PRE>
+<BR>
+Cacti graph: <a href="http://graphs.merlins.org/graphs/g.php?action=zoom&local_graph_id=89&rra_id=0&view_type=&graph_start=$unix_fromdate&graph_end=$unix_todate&graph_height=320&graph_width=800&title_font_size=10">http://graphs.merlins.org/graphs/g.php?action=zoom&local_graph_id=89&rra_id=0&view_type=&graph_start=$unix_fromdate&graph_end=$unix_todate&graph_height=320&graph_width=800&title_font_size=10</a><BR>
+<iframe src="http://graphs.merlins.org/graphs/g.php?action=zoom&local_graph_id=89&rra_id=0&view_type=&graph_start=$unix_fromdate&graph_end=$unix_todate&graph_height=320&graph_width=800&title_font_size=10"
+scrolling="auto" frameborder="no" align="center" height="660px" width="980px"></iframe>
+	    </BODY></HTML>
+EOF
+
+	}
+    }
+
+    # This can be used by the caller to get a sum of kwh per tier
+    return (\%rate_kwh_sum, $pv_start, $pv_stop);
+}
+
+
+## expects first and optional last day as 20091213 (just the day)
+#sub parse_month
+#{
+#    my ($first_day, $last_day, $tail) = @_;
+#    my @month_data;
+#    my %level_sums;
+#    my $numdays = 0;
+#    my $baseline;
+#
+#    # Load data
+#    my $fromdate = $first_day."000000";
+#
+#    if (not $last_day)
+#    {
+#	$last_day = DateCalc($first_day, "+1 month");
+#	# DateCalc("20091213", "+1 month") gives 2010011300:00:00
+#	$last_day =~ s/00:00:00//;
+#    }
+#    my $todate = $last_day."23:59:59";
+#
+#    if ($tail)
+#    {
+#	verbose("Will gather stats for $fromdate to $todate working on $tail lines");
+#	open(POWER, "tail -n $tail $LOGFILE |");
+#    }
+#    else
+#    {
+#	verbose("Will gather stats for $fromdate to $todate (reading the whole file)");
+#	open(POWER, $LOGFILE);
+#    }
+#    grep $MINUTEFILTER
+#    load_file_data(*POWER, \%data, $fromdate, $todate);
+#    close(POWER);
+#
+#    my $day = $first_day;
+#    while ($day le $last_day)
+#    {
+#	$numdays++;
+#	verbose("Analysing day $day (between $first_day and $last_day)");
+#        my ($level_kwh_sums, $pv_start, $pv_stop) = parse_and_print_day($day."00:00:00", $day."23:59:59", 0, 0);
+#
+#	foreach my $level (keys %{$level_kwh_sums})
+#	{
+#	    foreach my $i (House, AC, HouseNoAC, PV, PGE)
+#	    {
+#		$level_sums{$level}[$i] += $level_kwh_sums->{$level}[$i];
+#		verbose("level $level ".$probes[$i]." is now ".$level_sums{$level}[$i]."Kwh after adding ".$level_kwh_sums->{$level}[$i]." on day $day ($numdays)", 1);
+#	    }
+#	}
+#	$day = DateCalc($day, "+1 day");
+#	$day =~ s/00:00:00//;
+#    }
+#    $baseline = $numdays * BASELINEPERDAY;
+#
+#    print "Baseline for $numdays days will be estimated at $baseline kWh\n\n";
+#
+#    my $levelidx = 0;
+#    foreach my $probe (House, AC, HouseNoAC, PV, PGE)
+#    {
+#	my $probe_billed = 0;
+#	my $probe_kwh = 0;
+#
+#	foreach my $level (reverse sort {abs($a) <=> abs($b)} keys %level_sums)
+#	{
+#	    my $kwh = $level_sums{$level}[$probe];
+#	    my $log_kwh = $kwh;
+#	    my $sign = 1;
+#	    my $level_billed = 0;
+#
+#	    if ($kwh < 0)
+#	    {
+#		$sign = -1;
+#		$kwh *= -1;
+#	    }
+#
+#	    foreach my $tier (1..5)
+#	    {
+#		my $tier_allowed = $baseline * $tier_breakpoints[$tier] / 100;
+#		my $tier_billed;
+#		my $rate = peak_level_to_price($level, $tier-1);
+#		$_ = sprintf("%3.2f", $rate);
+#		s/^0//;
+#		$rate = $_;
+#
+#		print $levels{$level}." tier $tier: ";
+#		if ($kwh > $tier_allowed)
+#		{
+#		    $kwh -= $tier_allowed;
+#		    $tier_billed = $tier_allowed * $rate * $sign;
+#		    $level_billed += $tier_billed;
+#		    printf $probes[$probe]." has % 5.1fKwh at \$$rate/Kwh or a total of \$%4.2f (% 5.1fKwh left)\n", $tier_allowed * $sign, $tier_billed, $kwh * $sign;
+#		}
+#		else
+#		{
+#		    $tier_billed = $kwh * $rate * $sign;
+#		    $level_billed += $tier_billed;
+#		    printf $probes[$probe]." has % 5.1fKwh at \$$rate/Kwh or a total of \$%4.2f\n", $kwh * $sign, $tier_billed;
+#		    last;
+#		}
+#	    }
+#	    printf "Total ".$levels{$level}.": ".$probes[$probe]." had % 5.1fKwh for total of \$%4.2f\n", $log_kwh, $level_billed;
+#	    $probe_billed += $level_billed;
+#	    $probe_kwh += $log_kwh;
+#	}
+#	printf "Total: ".$probes[$probe]." had % 5.1fKwh for total of \$%4.2f\n", $probe_kwh, $probe_billed;
+#	print "\n";
+#    }
+#}
+
+
+
+# In my setup, each day of data is 1,122,913 lines, or 74MB. It is split in different files.
+# If your data has more than one day's worth per file, grep out the day you need before feeding
+# it to this script.
+sub day_run
+{
+    my ($day, $tail) = @_;
+    my @lines;
+
+    my %data;	# $data{$timeslot[idx]}
+
+    color("init");
+    if (not $day)
+    {
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime();
+	$year += 1900;
+	$mon = sprintf("%02d", $mon + 1);
+	$mday = sprintf("%02d", $mday);
+	$day = "$year$mon$mday";
+    }
+
+    # Load data
+    my $fromdate = $day."000000";
+    my $todate = $day."235959";
+    $tail="all" if (not defined $tail);
+
+    verbose("Will gather stats for $fromdate to $todate working on $tail lines");
+
+    if ($tail eq "all")
+    {
+	open(POWER, "$LOGFILE");
+    }
+    else
+    {
+	open(POWER, "tail -$tail $LOGFILE |");
+    }
+    @lines = grep(/$MINUTEFILTER/, <POWER>);
+    close(POWER);
+    # 2mn for 100,000 lines
+    load_file_data(\@lines, \%data, $fromdate, $todate);
+    # clear memory array to save memory for parsing
+    undef @lines;
+
+    parse_and_print_day(\%data, $fromdate, $todate);
+    color("end");
+}
+
+sub google_powermeter_dump
+{
+    my $lineblock = $PARSE_LINE_BLOCK;
+    my $pass;
+    my $exit = 0;
+
+    $pass = 1;
+    $pass = $ENV{'PEP_PASS'} if ($ENV{'PEP_PASS'});
+
+    open(POWER, $LOGFILE);
+
+    while (1)
+    {
+	my $i = 0;
+	my @lines = ();
+	my %data;	# $data{$timeslot[idx]}
+
+	warn("Start loop\n");
+	system("grep ^VmPeak /proc/$$/status >&2");
+
+	while (defined ($_ = <POWER>))
+	{
+	    /$TENMINUTEFILTER/ or next;
+	    push(@lines, $_);
+	    last if ($i == $lineblock);
+	    $i++;
+	}
+	$exit = 1 if (not defined($_));
+
+	warn("Data read\n");
+	system("grep ^VmPeak /proc/$$/status >&2");
+	warn("Read block of $i lines, now parsing (pass $pass) from ".$lines[0].$lines[1]." to ".$lines[$#lines]."\n");
+	$TEN_MIN_SAMPLE = 1;
+	load_file_data(\@lines, \%data, 0, "now");
+	warn("Data parsed\n");
+	system("grep ^VmPeak /proc/$$/status >&2");
+	# clear memory array to save memory for parsing
+	undef @lines;
+	warn("undef'ed lines\n");
+	system("grep ^VmPeak /proc/$$/status >&2");
+
+	warn("Parsed block of $i lines, now dumping variables (pass $pass) from ".$timeslot[0]." to ".$timeslot[$#timeslot]."\n");
+	# Skip volt probe
+	foreach my $i (0 .. $#probes)
+	{
+	    my $probe;
+	    my $probefn;
+
+	    $probe = $probes[$i];
+	    # Special hack to compute House consumption from ecm1
+	    if ($i eq 0)
+	    {
+		# No computation for anything but ecm1.
+		next if ($ECM ne "--ecm1");
+		$probe = "House";
+	    }
+
+	    ($probefn = $probe) =~ s/\//-/g;
+	    $probefn =~ s/ /_/g;
+	    $probefn =~ s/[^A-Za-z0-9]//g;
+	    next if ($probe =~ /^spare/);
+
+	    print "Dumping data for $probe\n";
+	    open(FH, ">>${LOGFILE}_$i.$probefn") or die "Can't open ${LOGFILE}_$i.$probefn: $!";
+
+	    foreach my $timeslot (0 .. $#timeslot)
+	    {
+		my $time = $timeslot[$timeslot];
+
+		if ($probe eq "House")
+		{
+		    my $pge = $data{$time}->{'PG&E'};
+		    my $pv = $data{$time}->{'PV'};
+		    next if ($pge eq "U" or $pv eq "U");
+		    $_ = $pge + $pv;
+		}
+		else
+		{
+		    $_ = $data{$time}->{$probe};
+		    next if ($_ eq "U");
+		}
+		# Center around 500,000 to get positive values if counter goes down.
+		$_ = cacti_var_munge($_);
+		# divide back from 1000th of Wh to KWh.
+		$_ /= 1000000;
+
+		print FH powermeter_date($time)." $_\n";
+	    }
+	    # Insert empty line between parsed blocks for debugging.
+	    print FH "\n";
+
+	    close(FH);
+	}
+	last if ($exit);
+	warn("printed block of data\n");
+	system("grep ^VmPeak /proc/$$/status >&2");
+	# free memory.
+	undef @timeslot;
+	undef %data;
+	warn("freed %data and %timeslot\n");
+	system("grep ^VmPeak /proc/$$/status >&2");
+	$pass++;
+	# Unfortunately none of the code that frees up data structures actually frees any data 
+	# structures on my linux system. Memory usage grew after parsing each time around, so I have
+	# to re-exec to start over from scratch.
+	$ENV{'PEP_PASS'} = $pass;
+	# close FH before exec which won't sync them.
+        close(POWER);
+	dbmclose(%counter_offsets);
+	exec("$0 $ECM --google-powermeter-dump --offset-noreset");
+    }
+    close(POWER);
+}
+
+sub cacti_dump
+{
+    my $from = $_[0] ? $_[0] : 0;
+    my $tail = $_[1] ? $_[1] : 0;
+    my $lineblock = $PARSE_LINE_BLOCK;
+    my $pass;
+    my $exit = 0;
+
+    $pass = 1;
+    $pass = $ENV{'PEP_PASS'} if ($ENV{'PEP_PASS'});
+
+    if (not $OFFSET_NORESET)
+    {
+	warn("Warning: running dump resets the correction counters in $dbfilename, starting in 10 seconds\n");
+	sleep 10;
+
+	# reset counter offsets
+	foreach my $probe (@probes)
+	{
+	    $counter_offsets{$probe} = '0|1970-01-01 00:00:00';
+	}
+    }
+
+    if ($tail)
+    {
+	verbose("Will gather stats from $from working on $tail lines");
+	open(POWER, "tail -n $tail $LOGFILE |");
+    }
+    else
+    {
+	verbose("Will gather stats for $from (reading the whole file)");
+	open(POWER, $LOGFILE);
+    }
+
+    while (1)
+    {
+	my $i = 0;
+	my @lines = ();
+	my %data;	# $data{$timeslot[idx]}
+
+	warn("Start loop\n");
+	system("grep ^VmPeak /proc/$$/status >&2");
+
+	while ($_ = <POWER>)
+	{
+	    /$TENSECFILTER/ or next;
+	    push(@lines, $_);
+	    last if ($i == $lineblock);
+	    $i++;
+	}
+	$exit = 1 unless ($i == $lineblock);
+	# 2mn for 100,000 lines
+	warn("Data read\n");
+	system("grep ^VmPeak /proc/$$/status >&2");
+	warn("Read block of $i lines, now parsing (pass $pass) from ".$lines[0].$lines[1]." to ".$lines[$#lines]."\n");
+	load_file_data(\@lines, \%data, $from, "now");
+	warn("Data parsed\n");
+	system("grep ^VmPeak /proc/$$/status >&2");
+	# clear memory array to save memory for parsing
+	undef @lines;
+	warn("undef'ed lines\n");
+	system("grep ^VmPeak /proc/$$/status >&2");
+
+	# 50s for 100,000 lines
+	warn("Parsed block of $i lines, now dumping to STDOUT (pass $pass) from ".$timeslot[0]." to ".$timeslot[$#timeslot]."\n");
+	foreach my $timeslot (0 .. $#timeslot)
+	{
+	    my $time = $timeslot[$timeslot];
+	    # first field is not munged, it's volts
+	    my $values = $data{$time}->{'Volts'};
+
+	    foreach my $probe (1 .. $#probes)
+	    {
+		# probes other than 0/Volts need to be munged to be centered at 500,000
+		$_ = $data{$time}->{$probes[$probe]};
+		$_ = cacti_var_munge($_) if ($_ ne "U");
+		$values .= ":$_";
+	    }
+	    if (not $values)
+	    {
+		warn "No values for ".date_to_epoch($time).", skipping...\n";
+	    }
+	    elsif ($values =~  /[A-TV-z]/)
+	    {
+		warn "Illegal characters in values for ".date_to_epoch($time).": $values, skipping...\n";
+	    }
+	    else
+	    {
+		print date_to_epoch($time).":$values\n";
+	    }
+	}
+	last if ($exit);
+	warn("printed block of data\n");
+	system("grep ^VmPeak /proc/$$/status >&2");
+	# free memory.
+	undef @timeslot;
+	undef %data;
+	warn("freed %data and %timeslot\n");
+	system("grep ^VmPeak /proc/$$/status >&2");
+	$pass++;
+	# Unfortunately none of the code that frees up data structures actually frees any data 
+	# structures on my linux system. Memory usage grew after parsing each time around, so I have
+	# to re-exec to start over from scratch.
+	$ENV{'PEP_PASS'} = $pass;
+	# close FH before exec which won't sync them.
+        close(POWER);
+	dbmclose(%counter_offsets);
+	exec("$0 $ECM --cacti-dump --offset-noreset");
+    }
+    close(POWER);
+}
+
+sub cacti_var_munge
+{
+    my ($_) = @_;
+
+    # cacti doesn't like negative numbers, let's init at 500,000 Kwh
+    $_ += 500000;
+    # Show Wh without commas to be a rrdtool DERIVE compatible
+    $_ *= 1000000;
+
+    return $_;
+}
+
+sub data_tail
+{
+    my ($mode, $var) = @_;
+    my @vars;
+    my @lines;
+    my $data_old;
+
+    my %data;	# $data{$timeslot[idx]}
+
+    # we try to get the last 20 samples' worth of data so that if the last
+    # samples are broken, this gets caught and fixed
+    open(POWER, "tail -n ".($REC_LINES*20)." $LOGFILE |");
+    @lines=<POWER>;
+    close(POWER);
+    load_file_data(\@lines, \%data, 0, "now");
+    if ($#timeslot eq -1)
+    {
+	warn("Was not able to read any data from $LOGFILE\n");
+	return 1;
+    }
+    return if ($#timeslot eq -1);
+    
+    my $lastdate = $timeslot[$#timeslot];
+    # Find out if the last sample is recent enough.
+    my $acceptable_time = DateCalc("now", "- 60 sec");
+
+    # mode 0: google powermeter, 1: cacti, 2: rrdtool
+    # powermeter is output with timestamps, the other 2 are output 'now'
+    if ($mode > 0 and $acceptable_time gt ParseDate($lastdate))
+    {
+	warn("FAIL: acceptable time $acceptable_time is still bigger than read $lastdate ($#timeslot timeslots)\n");
+	$data_old = "U";
+    }
+    
+    # adjust to match cacti order, also change in caller (see example in usage)
+    @vars = @probes;
+    if ($var)
+    {
+	if ($var =~ /^\d+$/)
+	{
+	    @vars = ($probes[$var]);
+	}
+	else
+	{
+	    @vars = ($var);
+	}
+    }
+
+    print powermeter_date($lastdate)." " if ($mode == 0);
+    print date_to_epoch($lastdate).":"   if ($mode == 2);
+
+    foreach my $probe (@vars)
+    {
+	# After the first field, what separator should be printed?
+	if ($probe ne "Volts")
+	{
+	    print " " if ($mode == 1);
+	    print ":" if ($mode == 2);
+	}
+
+	# Cacti requires printing fieldname:value
+	print fix_rrdtool_headers($probe).":" if ($mode == 1);
+
+	if ($data_old)
+	{
+	    print "U";
+	}
+	else
+	{
+	    my $value = $data{$lastdate}->{$probe};
+	    $value = $data{$lastdate}->{'PG&E'} + $data{$lastdate}->{'PV'} if ($probe eq 'House');
+
+	    # hack, don't munge slot 0, it's volts not KWh
+	    if ($probe eq "Volts" or $value eq "U")
+	    {
+		print $value;
+	    }
+	    else
+	    {
+		$value = cacti_var_munge($value);
+		# Convert to Kwh for powermeter
+		$value /= 1000000 if ($mode == 0);
+		print $value;
+	    }
+	}
+    }
+    print "\n";
+}
+
+
+sub usage
+{
+    print STDERR "$_[0]\n\n" if ($_[0]);
+    print STDERR <<EOF;
+
+    --ecmx is --ecm1 or --ecm2, to say which variables we expect to read.
+
+    $0 --ecmx [--google-powermeter var | --google-powermeter-dump]
+Output one variable in google powermeter format, or dump everything for
+batch feeding.
+
+    $0 --ecmx --cacti
+Output one variable in cacti format (to be used as a cacti query script), or
+dump everything for batch feeding. 
+Note that --cacti is not recommended because it does not output a timestamp and 
+can cause graph odities when mis-syncs happen (it is only a problem when you 
+read counters, not gauges), see --rrdtool below.
+
+Output looks like this:
+Volts:120.60 PGE:499695393799 PV:501960510919 Computer_Closet:500440226012 MythTV-AV_System:500313609925 Computer_Office-BR4:500049419658 AC:500093287437 Kitchen_Fridge:500118153794 spare0:U spare1:U spare2:U spare3:U spare4:U spare5:U
+
+    $0 --ecmx --cacti-dump > dump
+
+Creates a huge dump file meant to be used for rebuilding an rrd file like so:
+sort -u < dump | time xargs rrdtool update \$RRD --template `$0 --ecmx --cacti-dump-header`
+
+    $0 --ecmx --cacti-dump-header
+
+Used for feeding to rrdtool --template. Output looks like this:
+Volts:PGE:PV:Computer_Closet:MythTV-AV_System:Computer_Office-BR4:AC:Kitchen_Fridge:spare0:spare1:spare2:spare3:spare4:spare5
+
+    $0 --ecmx --parse-month 20090702 [20090802] (defaults to 30-ish days) 
+			      [tail lines, like 100000]
+Attempt at doing month summaries for bills with time of use
+calculation.
+
+    $0 --ecmx --rrdtool
+Output last sample in rrdtool format. Suitable for use like this:
+rrdtool update \$RRD --template `$0 --ecmx --cacti-dump-header` `$0 --rrdtool`
+The reason for using this is that if the data in your file updates as
+often as cacti queries it, they could get slightly out of sync once in a
+while and cacti would get 2 cycle's worth of updates, showing a jump and
+then a dip in your graph (not pretty).
+Instead, you turn off cacti rrd updating and update the RRD yourself each time
+you know you just got an update. This solves the race condition.
+
+    $0 --ecmx [--output none|tty|html] [20090801] [tail lines, like 10000 or 'all']
+Output daily summary for today or given date.
+
+    optional opts:
+    $0 --ecmx [--print-watts] [--print-time]
+EOF
+    exit;
+}
+
+GetOptions(
+    "verbose" => \$VERBOSE,
+    "output:s" => \$OUTPUTTYPE,
+    "parse-month" => \$PARSE_MONTH,
+    "print-time" => \$PRINT_TIME,
+    "rrdtool" => \$RRDTOOL,
+    "cacti" => \$CACTI,
+    "cacti-dump" => \$CACTI_DUMP,
+    "cacti-dump-header" => \$CACTI_DUMP_HEADER,
+    "google-powermeter:s" => \$GOOGLE_POWERMETER_TAIL,
+    "google-powermeter-dump" => \$GOOGLE_POWERMETER_DUMP,
+    "offset-noreset" => \$OFFSET_NORESET,
+) or usage;
+
+usage("bad --output $OUTPUTTYPE") unless grep(/^$OUTPUTTYPE$/, ("none", "tty", "html"));
+
+$dbfilename = "$LOGFILE.counter_offsets";
+
+$LOGFILE=$ENV{'PPLOGFILE'} if ($ENV{'PPLOGFILE'});
+if ($LOGFILE eq "-")
+{
+    warn("reading from STDIN (you must use stdbuf -oL $0 to avoid losing data at re-exec time for big input)\n");
+    $LOGFILE="<&STDIN";
+}
+else
+{
+    $dbfilename = "$LOGFILE.counter_offsets";
+}
+
+# Whether we want to force re-initialization of counters
+my $init_counter_offsets = 0;
+# parse_month and parse_day reparse data after the last offset has already been computed.
+# We do want to track jumps, but not to mess up the main offset we already computed, we
+# keep track of temporary throw away offsets in /var/tmp/
+
+# Unfortunately, day_run which we want local offsets for, can only be expressed as 
+# a list of not ARGV, hence the complex if below.
+if ($PARSE_MONTH or $GOOGLE_POWERMETER_DUMP or (not $RRDTOOL and not $CACTI and not $GOOGLE_POWERMETER_TAIL and not $CACTI_DUMP and not $CACTI_DUMP_HEADER))
+{
+    $dbfilename = "/var/tmp/parcecmpower_tmp.counter_offsets";
+    # We reset the offsets each time to allow for differential runs to create their
+    # own offsets while they run.
+    $init_counter_offsets = 1 if (not $OFFSET_NORESET);
+}
+
+warn("Get timer offsets from $dbfilename\n") if ($ENV{'PPLOGFILE'});
+open(FOO, ">>$dbfilename") or die "Can't open $dbfilename: $!\n";
+close(FOO);
+#tie (%counter_offsets, 'DB_File', $dbfilename, O_RDWR, 0, $DB_HASH) or die "Can't tie $dbfilename: $!";
+dbmopen(%counter_offsets, $dbfilename, 0666) or die "Can't tie $dbfilename: $!";
+
+# One time file init
+foreach my $probe (@probes)
+{
+    if (not defined $counter_offsets{$probe} or $init_counter_offsets)
+    {
+	$counter_offsets{$probe} = '0|1970-01-01 00:00:00';
+	warn "Init offset for $probe to 0\n" if not ($init_counter_offsets);
+    }
+    else
+    {
+	warn "Read offset ".probe_hash_value($counter_offsets{$probe})." at ".probe_hash_time($counter_offsets{$probe})." for $probe\n" if ($ENV{'PPLOGFILE'});
+    }
+}
+
+if ($RRDTOOL)
+{
+    data_tail(2);
+}
+elsif ($CACTI)
+{
+    data_tail(1);
+}
+elsif ($GOOGLE_POWERMETER_TAIL)
+{
+    data_tail(0, $GOOGLE_POWERMETER_TAIL);
+}
+elsif ($CACTI_DUMP)
+{
+    cacti_dump(@ARGV);
+}
+elsif ($CACTI_DUMP_HEADER)
+{
+    print "$template_str\n";
+}
+elsif ($GOOGLE_POWERMETER_DUMP)
+{
+    google_powermeter_dump();
+}
+elsif ($PARSE_MONTH)
+{
+    usage if ($#ARGV < 0 or $#ARGV > 2);
+    parse_month(@ARGV);
+}
+else
+{
+    day_run(@ARGV);
+}
+
+__END__
+This is what my RRD looks like if you're curious:
+/usr/bin/rrdtool create --start 1242148820 /var/lib/cacti/rra/housepower_21.rrd --step 120  DS:HouseNoAC:DERIVE:600:-1000000000:100000
+0000 DS:House:DERIVE:600:-1000000000:1000000000 DS:PGE:DERIVE:600:-1000000000:1000000000 DS:AC:DERIVE:600:-1000000000:1000000000 DS:PV:
+DERIVE:600:-1000000000:1000000000 RRA:AVERAGE:0.5:1:2628000 RRA:AVERAGE:0.5:30:525600 RRA:AVERAGE:0.5:120:131400 RRA:AVERAGE:0.5:1440:1
+0950 RRA:AVERAGE:0.5:5:3153600 RRA:MAX:0.5:30:525600 RRA:MAX:0.5:120:131400 RRA:MAX:0.5:1440:10950
+
+# vim:sts=4:sw=4

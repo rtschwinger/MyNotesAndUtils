@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+export PATH=/var/local/scr:$PATH
+
+case "$1" in
+  start)
+  	ecmread.py -p --serial --serialport /dev/ecm1 |  /var/local/scr/ecm_addnames1 >>/var/log/ecm/ecmread1 &
+  	ecmread.py -p --serial --serialport /dev/ecm2 |  /var/local/scr/ecm_addnames2 >>/var/log/ecm/ecmread2 &
+	;;
+  stop)
+  	killall ecmread.py
+	;;
+  restart|force-reload)
+  	$0 stop
+	$0 start
+	;;
+  *)
+	echo "Usage: ecm {start|stop|restart|force-reload}" >&2
+	exit 1
+	;;
+esac
+
+exit 0

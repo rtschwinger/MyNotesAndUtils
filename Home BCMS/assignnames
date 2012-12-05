@@ -1,0 +1,12 @@
+#!/bin/bash
+
+# stdbuf is in coreutils 7.5 or better
+stdbuf -oL sed \
+	-e "s/Volts:       /Phase2 Volts:/" \
+	-e "s/\(.*Ch1 Watts:.*\)/\1 < PG\&E/" \
+	-e "s/\(.*Ch2 Watts:.*\)/\1 < PV/" \
+	-e "s/\(.*Aux1 Watts:.*\)/\1 < Computer Closet/" \
+	-e "s/\(.*Aux2 Watts:.*\)/\1 < MythTV\/AV System/" \
+	-e "s/\(.*Aux3 Watts:.*\)/\1 < Computer Office\/BR4/" \
+	-e "s/\(.*Aux4 Watts:.*\)/\1 < AC/" \
+	-e "s/\(.*Aux5 Watts:.*\)/\1 < Kitchen Fridge/" 

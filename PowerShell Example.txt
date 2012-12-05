@@ -1,0 +1,126 @@
+﻿$PreSecond = get-content PreSecond.txt
+New-Item “C:\Myworkplace\ps\Second.txt” -Type file
+foreach ($Hostname in $PreSecond)
+{
+$second = $Hostname.split(‘.’)[0]
+Add-content “C:\Myworkplace\ps\Second.txt” $second
+}
+
+$MachineName = Read-Host “Enter Machine Name”
+Gwmi -Name Root\Cimv2 -cl Win32_Product –Comp $MachineName |
+Select Name, Version |
+Export-Csv C:\Win32_Product.Csv –NoType
+
+How do you run this command in powershell:
+
+C:\Program Files\IIS\Microsoft Web Deploy\msdeploy.exe -verb:sync -source:dbfullsql="Data Source=mysource;Integrated Security=false;User ID=sa;Pwd=sapass!;Database=mydb;" -dest:dbfullsql="Data Source=.\mydestsource;Integrated Security=false;User ID=sa;Pwd=sapass!;Database=mydb;",computername=10.10.10.10,username=administrator,password=adminpass"
+powershell parameters quotes exe spaces
+link|improve this question
+	
+asked Nov 4 '09 at 14:10
+Vans
+76113
+	
+feedback
+4 Answers
+active oldest votes
+up vote 21 down vote
+	
+
+When PowerShell sees a command starting with a string it just evaluates the string ie it typically echos it to the screen e.g.:
+
+PS> "Hello World"
+Hello World
+
+If you want PowerShell to interpret the string as a command name then use the call operator (&) like so:
+
+PS> & 'C:\Program Files\IIS\Microsoft Web Deploy\msdeploy.exe'
+
+After that you probably only need to quote parameter/arg pairs that contain spaces and/or quotation chars. When you invoke an exe like this with complex command line arguments it is usually very helpful to have tool that will show you how PowerShell sends the arguments to the exe. The PowerShell Community Extensions has such a tool. It is called echoargs. You just replace the exe with echoargs - leaving all the arguments in place and it will show you how the exe will receive the args e.g.:
+
+PS> echoargs -verb:sync -source:dbfullsql="Data Source=mysource;Integrated Security=false;User ID=sa;Pwd=sapass!;Database=mydb;" -dest:dbfullsql="Data Source=.\mydestsource;Integrated Security=false;User ID=sa;Pwd=sapass!;Database=mydb;",computername=10.10.10.10,username=administrator,password=adminpass
+
+Arg 0 is <-verb:sync>
+Arg 1 is <-source:dbfullsql=Data>
+Arg 2 is <Source=mysource;Integrated>
+Arg 3 is <Security=false;User>
+Arg 4 is <ID=sa;Pwd=sapass!;Database=mydb;>
+Arg 5 is <-dest:dbfullsql=Data>
+Arg 6 is <Source=.\mydestsource;Integrated>
+Arg 7 is <Security=false;User>
+Arg 8 is <ID=sa;Pwd=sapass!;Database=mydb; computername=10.10.10.10 username=administrator password=adminpass>
+
+Using echoargs you can experiment until you get it right e.g.:
+
+PS> echoargs -verb:sync "-source:dbfullsql=Data Source=mysource;Integrated Security=false;User ID=sa;Pwd=sapass!;Database=mydb;"
+Arg 0 is <-verb:sync>
+Arg 1 is <-source:dbfullsql=Data Source=mysource;Integrated Security=false;User ID=sa;Pwd=sapass!;Database=mydb;>
+
+Turns out I was trying too hard before to maintain the double quotes around the connection string. Apparently that isn't necessary because even cmd.exe will strip those out.
+
+BTW hats off to the PowerShell team. They were quite helpful in showing me the specific incantation of single & double quotes to get the desired result - if you needed to keep the internal double quotes in place. :-) They also realize this is an area of pain but they are driven by the number of folks are affected by a particular issue. If this is an area of pain for you, then please vote up this PowerShell bug submission.
+
+For more info on how PowerShell parses, check out my Effective PowerShell blog series - specifically item 10 - "Understanding PowerShell Parsing Modes".
+link|improve this answer
+	
+edited Nov 7 '09 at 18:10
+
+	
+answered Nov 4 '09 at 16:23
+Keith Hill
+26.5k21437
+	
+	
+if using as second example, i get this error: Error: Unrecognized argument '"-source:dbfullsql="""Data'. All arguments must begin with "-". – Vans Nov 6 '09 at 11:18
+	
+Try the second example again - I modified it. – Keith Hill Nov 7 '09 at 18:11
+	
+I'm sorry, I don't understand. I see that, currently, 6 people have upvoted the answer so I am missing something obvious, but what is the actual answer? Is there a special rule to know about parameters with spaces with PowerShell, or are you just suggesting to take it case-by-case, using EchoArgs to help? – Tyler Collier Feb 12 '11 at 1:49
+	
+Quoting the arguments is usually sufficient but not always. In those cases where it doesn't work, using echoargs gives an indication of how PowerShell is interpreting the arguments before it passes them onto the EXE. – Keith Hill Feb 12 '11 at 2:26
+feedback
+up vote 2 down vote
+	
+
+just add & command before exe name here is command to install sql server express in silence mode
+
+$fileExe = "T:\SQLEXPRADV_x64_ENU.exe" $CONFIGURATIONFILE = "T:\ConfSetupSql2008Express.ini"
+
+& $fileExe /CONFIGURATIONFILE=$CONFIGURATIONFILE
+
+best regards
+link|improve this answer
+	
+answered Jan 10 '11 at 13:24
+nonolde1er
+211
+	
+feedback
+up vote 1 down vote
+	
+
+Try putting single quotes around the executable and parameters, something like this:
+
+'C:\Program Files\IIS\Microsoft Web Deploy\msdeploy.exe' '-verb:sync' '-source:dbfullsql="Data Source=mysource;Integrated Security=false;User ID=sa;Pwd=sapass!;Database=mydb;"' '-dest:dbfullsql="Data Source=.\mydestsource;Integrated Security=false;User ID=sa;Pwd=sapass!;database=mydb;",computername=10.10.10.10,username=administrator,password=adminpass"'
+
+	
+	
+I tried and i get this error: Unexpected token '-verb:sync' in expression or statement. – Vans Nov 6 '09 at 11:11
+feedback
+up vote 0 down vote
+	
+
+I was able to get my similar command working using the following approach:
+
+msdeploy.exe -verb=sync "-source=dbFullSql=Server=THESERVER;Database=myDB;UID=sa;Pwd=saPwd" -dest=dbFullSql=c:\temp\test.sql
+
+For your command (not that it helps much now), things would look something like this:
+
+msdeploy.exe -verb=sync "-source=dbfullsql=Server=mysource;Trusted_Connection=false;UID=sa;Pwd=sapass!;Database=mydb;" "-dest=dbfullsql=Server=mydestsource;Trusted_Connection=false;UID=sa;Pwd=sapass!;Database=mydb;",computername=10.10.10.10,username=administrator,password=adminpass
+
+The key points are:
+
+    Use quotes around the source argument, and remove the embedded quotes around the connection string
+    Use the alternative key names in building the SQL connection string that don't have spaces in them. For example, use "UID" instead of "User Id", "Server" instead of "Data Source", "Trusted_Connection" instead of "Integrated Security", and so forth. I was only able to get it to work once I removed all spaces from the connection string.
+
+I didn't try adding the "computername" part at the end of the command line, but hopefully this info will help others reading this now get closer to their desired result.

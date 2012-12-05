@@ -1,0 +1,31 @@
+C:\Program Files\VisualSVN Server\bin>svnadmin load --parent-dir F:\ProjectRepos\Projects\trunk\SolarWorld F:\ProjectRepos\SolarWorld < F:ProjectRepos\solarworld.dmp
+<<< Started new transaction, based on original revision 1
+     * adding path : F:/ProjectRepos/Projects/trunk/SolarWorld/Backgrounds ...svnadmin: File not found: transaction '3-5', path 'F
+:/ProjectRepos/Projects/trunk/SolarWorld/Backgrounds'
+
+#Working command
+svnlook info f:\ProjectRepos\SolarWorld
+
+# Working history of Repository command
+svnlook history F:\ProjectRepos\PowerLoft
+
+svnadmin hotcopy F:\ProjectRepos\SolarWorld F:\ProjectRepos\Projects\trunk
+
+# These are working svn dump command lines
+svnadmin dump F:\ProjectRepos\PowerLoft > f:\backup\powerloft_repoBU.dmp
+svnadmin dump F:\ProjectRepos\SolarWorld > f:\backup\solarworld_repoBU.dmp
+svnadmin dump F:\ProjectRepos\MSN_CH1 > f:\backup\MSN_CH1_repoBU.dmp
+svnadmin dump F:\ProjectRepos\My_Utils > f:\backup\My_Utils_repoBU.dmp
+svnadmin dump F:\ProjectRepos\GIMP_Addons > f:\backup\GIMP_Addons_repoBU.dmp
+svnadmin dump F:\ProjectRepos\Surabaya > f:\backup\Surabaya_repoBU.dmp
+
+svnadmin load --parent-dir F:\ProjectRepos\Projects\trunk\Surabaya F:\ProjectRepos\Projects\ < f:\backup\Surabaya_repoBU.dmp
+
+svnadmin load --parent-dir F:\ProjectRepos\Projects\trunk\My_Utils F:\ProjectRepos\Projects\ < f:\backup\My_Utils_repoBU.dmp
+
+svnadmin load /var/svn/projects --parent-dir calc < calc-dumpfile
+
+svn mkdir -m "Initial project roots" file:///F:\ProjectRepos\Projects\trunk\My_Utils
+file:///var/svn/projects/calc \
+file:///var/svn/projects/calendar \
+file:///var/svn/projects/spreadsheet

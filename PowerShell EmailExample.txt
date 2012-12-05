@@ -1,0 +1,1 @@
+powershell Send-MailMessage -from "RPU12VIP@powerloft.com" -to "robert.schwinger@siemens.com" -SmtpServer "10.10.10.254" -subject "Test e-mail from Nick using powershell" -body "Test Message from Nick Using PowerShell Send-MailMessage command using RPU12@powerloft.com as the sender"

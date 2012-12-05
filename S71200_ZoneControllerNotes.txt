@@ -1,0 +1,20 @@
+﻿C Blue Common
+Y Yellow A/C Compressor
+W White Heat
+G Green Fan
+R Red Power
+
+C Blue Common
+Y Yellow (A/C Compressor)
+W White (Heat)
+G Green (Fan)
+R Red Power
+
+
+Damper Upstairs
+Damper Downstairs
+
+
+Siemens S7-1200 SM1232 Analog Output Signal Module with 
+2 analog outputs, +/- 10 V with 14 bit or 0 .. 20 mA with 13 bit
+6ES7232-4HB30-0XB0
